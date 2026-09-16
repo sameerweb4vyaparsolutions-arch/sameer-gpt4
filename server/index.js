@@ -140,8 +140,7 @@ async function callGroq(messages) {
 // ======================================================
 
 async function generateImage(prompt) {
-  const apiKey =
-    process.env.POLLINATIONS_API_KEY;
+  const apiKey = process.env.POLLINATIONS_API_KEY;
 
   if (!apiKey) {
     throw new Error(
@@ -149,14 +148,9 @@ async function generateImage(prompt) {
     );
   }
 
-  const model =
-    process.env.IMAGE_MODEL || 'flux';
-
-  const width =
-    Number(process.env.IMAGE_WIDTH) || 1024;
-
-  const height =
-    Number(process.env.IMAGE_HEIGHT) || 1024;
+  const model = process.env.IMAGE_MODEL || 'flux';
+  const width = Number(process.env.IMAGE_WIDTH || 1024);
+  const height = Number(process.env.IMAGE_HEIGHT || 1024);
 
   const params = new URLSearchParams({
     model,
@@ -166,17 +160,12 @@ async function generateImage(prompt) {
     enhance: 'true'
   });
 
-  const imageURL =
+  const url =
     `https://gen.pollinations.ai/image/` +
     `${encodeURIComponent(prompt)}?${params.toString()}`;
 
-  console.log(
-    `Generating image using ${model}`
-  );
-
-  const response = await fetch(imageURL, {
+  const response = await fetch(url, {
     method: 'GET',
-
     headers: {
       Authorization: `Bearer ${apiKey}`,
       Accept: 'image/*'
@@ -184,47 +173,31 @@ async function generateImage(prompt) {
   });
 
   if (!response.ok) {
-    const errorText =
-      await response.text();
+    const errorText = await response.text();
 
     throw new Error(
-      `Pollinations API error ${response.status}: ` +
-      errorText.slice(0, 1000)
+      `Pollinations error ${response.status}: ${errorText.slice(0, 500)}`
     );
   }
 
   const contentType =
-    response.headers.get('content-type') || '';
-
-  // Pollinations should return an image.
-  // If HTML/JSON comes back, report it instead
-  // of sending invalid image data to frontend.
+    response.headers.get('content-type') || 'image/jpeg';
 
   if (!contentType.startsWith('image/')) {
-    const unexpectedResponse =
-      await response.text();
+    const text = await response.text();
 
     throw new Error(
-      `Pollinations returned ${contentType || 'an unknown content type'} instead of an image: ` +
-      unexpectedResponse.slice(0, 500)
+      `Pollinations returned ${contentType}: ${text.slice(0, 500)}`
     );
   }
 
-  const arrayBuffer =
-    await response.arrayBuffer();
+  const arrayBuffer = await response.arrayBuffer();
+  const buffer = Buffer.from(arrayBuffer);
 
-  const buffer =
-    Buffer.from(arrayBuffer);
-
-  if (!buffer.length) {
-    throw new Error(
-      'Pollinations returned an empty image.'
-    );
-  }
+  const base64 = buffer.toString('base64');
 
   return {
-    buffer,
-    contentType,
+    image: `data:${contentType};base64,${base64}`,
     model
   };
 }
@@ -292,8 +265,7 @@ app.post('/api/chat', async (req, res) => {
 
 app.post('/api/image', async (req, res) => {
   try {
-    const prompt =
-      String(req.body?.prompt || '').trim();
+    const prompt = String(req.body?.prompt || '').trim();
 
     if (!prompt) {
       return res.status(400).json({
@@ -307,36 +279,16 @@ app.post('/api/image', async (req, res) => {
       });
     }
 
-    const result =
-      await generateImage(prompt);
+    const result = await generateImage(prompt);
 
-    res.setHeader(
-      'Content-Type',
-      result.contentType
-    );
-
-    res.setHeader(
-      'Content-Length',
-      result.buffer.length
-    );
-
-    res.setHeader(
-      'Cache-Control',
-      'no-store'
-    );
-
-    res.setHeader(
-      'X-Image-Model',
-      result.model
-    );
-
-    return res.send(result.buffer);
+    return res.json({
+      image: result.image,
+      prompt,
+      model: result.model
+    });
 
   } catch (error) {
-    console.error(
-      'Image generation error:',
-      error
-    );
+    console.error('Image generation error:', error);
 
     return res.status(500).json({
       error: 'Image generation failed',
