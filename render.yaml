@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: sameer-gpt
+    runtime: node
+    plan: free
+    buildCommand: npm install && npm run install:all && npm run build
+    startCommand: npm start
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: GROQ_API_KEY
+        sync: false
+      - key: GROQ_MODEL
+        value: openai/gpt-oss-20b
+      - key: POLLINATIONS_API_KEY
+        sync: false
+      - key: IMAGE_MODEL
+        value: flux
+      - key: IMAGE_WIDTH
+        value: 1024
+      - key: IMAGE_HEIGHT
+        value: 1024
