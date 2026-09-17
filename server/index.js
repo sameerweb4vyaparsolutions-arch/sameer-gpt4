@@ -136,8 +136,252 @@ async function callGroq(messages) {
 }
 
 // ======================================================
-// POLLINATIONS IMAGE GENERATION
+// SMART POLLINATIONS IMAGE GENERATION
+// Automatically chooses a better model for posters,
+// logos, product photos, realistic images, or general art.
 // ======================================================
+
+const IMAGE_MODEL_PREFERENCES = {
+  poster: [
+    'ideogram-ai/ideogram-v4-quality',
+    'ideogram-ai/ideogram-v4-balanced',
+    'qwen/qwen-image-3',
+    'bytedance/seedream-5.0-pro',
+    'black-forest-labs/flux.2-pro',
+    'black-forest-labs/flux.1-schnell'
+  ],
+  logo: [
+    'recraft/recraft-v4.1-vector',
+    'ideogram-ai/ideogram-v4-quality',
+    'qwen/qwen-image-3',
+    'black-forest-labs/flux.2-pro',
+    'black-forest-labs/flux.1-schnell'
+  ],
+  product: [
+    'bytedance/seedream-5.0-pro',
+    'black-forest-labs/flux.2-pro',
+    'qwen/qwen-image-3',
+    'x-ai/grok-imagine-image-quality',
+    'black-forest-labs/flux.1-schnell'
+  ],
+  photo: [
+    'bytedance/seedream-5.0-pro',
+    'black-forest-labs/flux.2-pro',
+    'x-ai/grok-imagine-image-quality',
+    'qwen/qwen-image-3',
+    'black-forest-labs/flux.1-schnell'
+  ],
+  general: [
+    'qwen/qwen-image-3',
+    'bytedance/seedream-5.0-lite',
+    'tongyi-mai/z-image-turbo',
+    'black-forest-labs/flux.1-schnell'
+  ]
+};
+
+let imageModelCache = {
+  expiresAt: 0,
+  models: null
+};
+
+function unique(values) {
+  return [...new Set(values.filter(Boolean))];
+}
+
+function detectImageIntent(prompt) {
+  const value = String(prompt || '').toLowerCase();
+
+  const logoWords = [
+    'logo', 'logotype', 'brand mark', 'brandmark', 'monogram',
+    'emblem', 'vector logo', 'company logo', 'app icon'
+  ];
+
+  const posterWords = [
+    'poster', 'banner', 'flyer', 'social media post', 'social post',
+    'instagram post', 'facebook post', 'festival post', 'greeting post',
+    'advertisement', 'advertising creative', 'ad creative', 'promo banner',
+    'promotional banner', 'thumbnail', 'brochure cover', 'invitation card',
+    'visiting card', 'business card', 'letterhead', 'hoarding'
+  ];
+
+  const productWords = [
+    'product image', 'product photo', 'product photography', 'catalog image',
+    'catalogue image', 'catalog-ready', 'catalog ready', 'ecommerce image',
+    'e-commerce image', 'packshot', 'studio product', 'isolated product',
+    'professional product', 'product poster'
+  ];
+
+  const photoWords = [
+    'photorealistic', 'photo realistic', 'realistic photo', 'portrait',
+    'cinematic photo', 'professional photography', 'dslr', 'fashion photo'
+  ];
+
+  if (logoWords.some((word) => value.includes(word))) return 'logo';
+  if (posterWords.some((word) => value.includes(word))) return 'poster';
+  if (productWords.some((word) => value.includes(word))) return 'product';
+  if (photoWords.some((word) => value.includes(word))) return 'photo';
+  return 'general';
+}
+
+function extractRequestedSize(prompt) {
+  const defaultWidth = Number(process.env.IMAGE_WIDTH || 1024);
+  const defaultHeight = Number(process.env.IMAGE_HEIGHT || 1024);
+  const text = String(prompt || '');
+
+  // Handles 1080x1080, 1080*1080 and 1080 × 1080.
+  const match = text.match(/(?:size\s*[:=-]?\s*)?(\d{3,4})\s*[xX×*]\s*(\d{3,4})/i);
+  if (!match) return { width: defaultWidth, height: defaultHeight };
+
+  const width = Math.min(2048, Math.max(256, Number(match[1])));
+  const height = Math.min(2048, Math.max(256, Number(match[2])));
+  return { width, height };
+}
+
+function enhanceImagePrompt(prompt, intent) {
+  const original = String(prompt || '').trim();
+  const lower = original.toLowerCase();
+  const noText = /without\s+text|no\s+text|textless|without\s+words/.test(lower);
+
+  if (intent === 'poster') {
+    if (noText) {
+      return `${original}\n\nCreate a polished, professional commercial poster/banner composition with strong visual hierarchy, balanced spacing, premium lighting, clean edges, and an attractive finished advertising look. Do not add any text, letters, numbers, watermark, logo, or invented contact details.`;
+    }
+    return `${original}\n\nCreate a polished, professional poster/banner ready for commercial use. Keep all user-provided names, phone numbers, website URLs, dates and wording exactly as written. Prioritize accurate, legible typography, strong visual hierarchy, balanced spacing, premium composition and clean branding. Do not invent extra company details or change spellings.`;
+  }
+
+  if (intent === 'logo') {
+    return `${original}\n\nCreate a professional, clean, scalable brand mark with strong geometry, balanced proportions and clear visual identity. Keep any requested company name exactly as written. Avoid unnecessary mockup clutter, watermarks and invented wording.`;
+  }
+
+  if (intent === 'product') {
+    return `${original}\n\nCreate a clean, new-looking, premium catalog-ready product image with realistic materials, crisp details, studio-quality lighting, accurate proportions and a professional commercial photography finish. Do not add watermark or unrelated text.`;
+  }
+
+  if (intent === 'photo') {
+    return `${original}\n\nCreate a highly realistic professional photograph with natural detail, believable lighting, accurate anatomy, refined composition and high-end camera quality. Avoid watermarks and random text.`;
+  }
+
+  return `${original}\n\nCreate a polished, high-quality image with coherent composition, crisp details, professional lighting and no watermark.`;
+}
+
+function getEnvironmentOverride(intent) {
+  const envName = {
+    poster: 'IMAGE_MODEL_POSTER',
+    logo: 'IMAGE_MODEL_LOGO',
+    product: 'IMAGE_MODEL_PRODUCT',
+    photo: 'IMAGE_MODEL_PHOTO',
+    general: 'IMAGE_MODEL_DEFAULT'
+  }[intent];
+
+  return envName ? process.env[envName] : null;
+}
+
+async function getAvailableImageModels(apiKey) {
+  if (imageModelCache.models && Date.now() < imageModelCache.expiresAt) {
+    return imageModelCache.models;
+  }
+
+  try {
+    const response = await fetch('https://gen.pollinations.ai/image/models?community=false', {
+      headers: { Authorization: `Bearer ${apiKey}` }
+    });
+
+    if (!response.ok) {
+      throw new Error(`model catalogue returned ${response.status}`);
+    }
+
+    const data = await response.json();
+    const items = Array.isArray(data) ? data : (Array.isArray(data?.data) ? data.data : []);
+
+    const models = items
+      .filter((item) => {
+        const outputs = item?.output_modalities;
+        return !Array.isArray(outputs) || outputs.includes('image');
+      })
+      .map((item) => item?.id || item?.model || item?.name)
+      .filter(Boolean);
+
+    imageModelCache = {
+      models: new Set(models),
+      expiresAt: Date.now() + 10 * 60 * 1000
+    };
+
+    return imageModelCache.models;
+  } catch (error) {
+    console.warn('Could not refresh Pollinations image model catalogue:', error.message);
+    return null;
+  }
+}
+
+async function imageUrlToDataUrl(url) {
+  const response = await fetch(url);
+  if (!response.ok) {
+    throw new Error(`Generated media download failed with ${response.status}`);
+  }
+
+  const contentType = response.headers.get('content-type') || 'image/png';
+  const buffer = Buffer.from(await response.arrayBuffer());
+  return `data:${contentType};base64,${buffer.toString('base64')}`;
+}
+
+async function generateWithPollinationsModel({ apiKey, model, prompt, width, height }) {
+  const response = await fetch('https://gen.pollinations.ai/v1/images/generations', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${apiKey}`
+    },
+    body: JSON.stringify({
+      model,
+      prompt,
+      n: 1,
+      size: `${width}x${height}`,
+      quality: 'high',
+      response_format: 'b64_json'
+    })
+  });
+
+  const contentType = response.headers.get('content-type') || '';
+
+  if (!response.ok) {
+    const body = await response.text();
+    const error = new Error(`Pollinations ${model} error ${response.status}: ${body.slice(0, 700)}`);
+    error.status = response.status;
+    throw error;
+  }
+
+  // OpenAI-compatible endpoint should return JSON. This fallback also
+  // protects the frontend if a provider unexpectedly returns image bytes.
+  if (contentType.startsWith('image/')) {
+    const buffer = Buffer.from(await response.arrayBuffer());
+    return `data:${contentType};base64,${buffer.toString('base64')}`;
+  }
+
+  const raw = await response.text();
+  let data;
+  try {
+    data = JSON.parse(raw);
+  } catch {
+    throw new Error(`Pollinations ${model} returned invalid JSON: ${raw.slice(0, 300)}`);
+  }
+
+  const item = data?.data?.[0];
+  if (!item) {
+    throw new Error(`Pollinations ${model} returned no image data.`);
+  }
+
+  if (item.b64_json) {
+    if (String(item.b64_json).startsWith('data:')) return item.b64_json;
+    const mediaType = item.media_type || 'image/png';
+    return `data:${mediaType};base64,${item.b64_json}`;
+  }
+
+  if (item.url) {
+    return imageUrlToDataUrl(item.url);
+  }
+
+  throw new Error(`Pollinations ${model} response did not contain b64_json or url.`);
+}
 
 async function generateImage(prompt) {
   const apiKey = process.env.POLLINATIONS_API_KEY;
@@ -148,58 +392,65 @@ async function generateImage(prompt) {
     );
   }
 
-  const model = process.env.IMAGE_MODEL || 'flux';
-  const width = Number(process.env.IMAGE_WIDTH || 1024);
-  const height = Number(process.env.IMAGE_HEIGHT || 1024);
+  const intent = detectImageIntent(prompt);
+  const { width, height } = extractRequestedSize(prompt);
+  const finalPrompt = enhanceImagePrompt(prompt, intent);
+  const availableModels = await getAvailableImageModels(apiKey);
 
-  const params = new URLSearchParams({
-    model,
-    width: String(width),
-    height: String(height),
-    nologo: 'true',
-    enhance: 'true'
-  });
+  const environmentOverride = getEnvironmentOverride(intent);
+  const legacyFallback = process.env.IMAGE_MODEL || 'black-forest-labs/flux.1-schnell';
 
-  const url =
-    `https://gen.pollinations.ai/image/` +
-    `${encodeURIComponent(prompt)}?${params.toString()}`;
+  let candidates = unique([
+    environmentOverride,
+    ...IMAGE_MODEL_PREFERENCES[intent],
+    legacyFallback,
+    'black-forest-labs/flux.1-schnell',
+    'tongyi-mai/z-image-turbo'
+  ]);
 
-  const response = await fetch(url, {
-    method: 'GET',
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      Accept: 'image/*'
+  // When the authenticated catalogue is available, prefer only models that
+  // this key can currently access. Keep legacy aliases as final fallbacks.
+  if (availableModels?.size) {
+    const permitted = candidates.filter((model) => availableModels.has(model));
+    candidates = unique([
+      ...permitted,
+      legacyFallback,
+      'black-forest-labs/flux.1-schnell',
+      'tongyi-mai/z-image-turbo'
+    ]);
+  }
+
+  let lastError = null;
+
+  for (const model of candidates.slice(0, 6)) {
+    try {
+      console.log(`Image request type=${intent}, model=${model}, size=${width}x${height}`);
+
+      const image = await generateWithPollinationsModel({
+        apiKey,
+        model,
+        prompt: finalPrompt,
+        width,
+        height
+      });
+
+      return {
+        image,
+        model,
+        intent,
+        width,
+        height
+      };
+    } catch (error) {
+      lastError = error;
+      console.warn(`Image model failed (${model}):`, error.message);
+
+      // Invalid authentication cannot be solved by trying a different model.
+      if (error.status === 401) throw error;
     }
-  });
-
-  if (!response.ok) {
-    const errorText = await response.text();
-
-    throw new Error(
-      `Pollinations error ${response.status}: ${errorText.slice(0, 500)}`
-    );
   }
 
-  const contentType =
-    response.headers.get('content-type') || 'image/jpeg';
-
-  if (!contentType.startsWith('image/')) {
-    const text = await response.text();
-
-    throw new Error(
-      `Pollinations returned ${contentType}: ${text.slice(0, 500)}`
-    );
-  }
-
-  const arrayBuffer = await response.arrayBuffer();
-  const buffer = Buffer.from(arrayBuffer);
-
-  const base64 = buffer.toString('base64');
-
-  return {
-    image: `data:${contentType};base64,${base64}`,
-    model
-  };
+  throw lastError || new Error('No Pollinations image model was available for this request.');
 }
 
 // ======================================================
